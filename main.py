@@ -1,13 +1,14 @@
 """
 Credit Card Fraud Detection Framework
 
-This module defines a FastAPI application with endpoints for real-time fraud detection 
-on credit card transactions. It combines rule-based validators and machine-learning 
-models (Isolation Forest & Logistic Regression) to score transactions. The configuration 
-supports dynamic rule updates via environment variables. The design follows PCI DSS and 
-GDPR compliance guidelines by masking sensitive data and minimizing personal data usage 
-in logs. OpenAPI documentation is automatically generated for all endpoints. Embedded 
-pytest unit tests are included for validating functionality.
+This module defines a FastAPI application with endpoints for real-time fraud 
+detection on credit card transactions. It combines rule-based validators and 
+machine-learning models (Isolation Forest & Logistic Regression) to score 
+transactions. The configuration supports dynamic rule updates via environment 
+variables. The design follows PCI DSS and GDPR compliance guidelines by masking 
+sensitive data and minimizing personal data usage in logs. OpenAPI documentation 
+is automatically generated for all endpoints. Embedded pytest unit tests are 
+included for validating functionality.
 """
 
 import os
@@ -20,7 +21,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.linear_model import LogisticRegression
 import numpy as np
 
-# Configure logging for the module (could be refined to integrate with a logging config file)
+# Configure logging for the module
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s"
@@ -125,12 +126,12 @@ class RuleEngine:
         field = rule.get("field")
         operator = rule.get("operator")
         expected_value = rule.get("value")
-        
+
         if field not in transaction:
             return False
-            
+
         actual_value = transaction[field]
-        
+
         try:
             if operator in [">", "<"]:
                 return self._evaluate_numeric_rule(actual_value, expected_value, operator)
@@ -151,13 +152,11 @@ class RuleEngine:
         Returns a list of rule names that were triggered (violated) by the transaction.
         """
         triggered_rules: List[str] = []
-        
         for rule in self.rules:
             if self._evaluate_single_rule(rule, transaction):
                 rule_name = str(rule.get("name") or "UnnamedRule")
                 triggered_rules.append(rule_name)
                 logger.info("Rule triggered: %s -> %s", rule_name, rule.get("message"))
-                
         return triggered_rules
 
 # Instantiate the global RuleEngine with the loaded configuration
@@ -205,9 +204,9 @@ class FraudModelManager:
         # Feature 1: amount, Feature 2: is_foreign (0 or 1 as above).
         x_train_log = np.array([
             [50.0, 0],      # low amount, domestic -> not fraud
-            [200.0, 1],     # low amount, foreign -> fraud (perhaps stolen card used abroad for small amount)
-            [5000.0, 0],    # high amount, domestic -> not fraud (e.g., a legitimate large purchase in home country)
-            [10000.0, 1]    # high amount, foreign -> fraud (large foreign transaction)
+            [200.0, 1],     # low amount, foreign -> fraud
+            [5000.0, 0],    # high amount, domestic -> not fraud
+            [10000.0, 1]    # high amount, foreign -> fraud
         ])
         y_train_log = np.array([0, 1, 0, 1])  # corresponding labels
         try:
@@ -215,7 +214,7 @@ class FraudModelManager:
             logger.info("Logistic Regression model trained on synthetic labeled data.")
         except Exception as e:
             logger.error("Error training Logistic Regression model: %s", e)
-            # If training fails, we raise an exception to avoid running with an untrained model
+            # If training fails, raise an exception to avoid running with an untrained model
             raise
 
     def score_transaction(self, transaction: Dict[str, Any]) -> Dict[str, Any]:
@@ -230,7 +229,7 @@ class FraudModelManager:
             amount = float(transaction.get("amount", 0.0))
         except Exception:
             amount = 0.0
-        # Define "is_foreign" feature: here, treat country != "US" as foreign (1) for example.
+        # Define "is_foreign" feature: treat country != "US" as foreign (1).
         country_code = transaction.get("country")
         is_foreign = 0
         if country_code and isinstance(country_code, str):
@@ -242,7 +241,6 @@ class FraudModelManager:
         isolation_anomaly = bool(iso_pred == -1)
         # Logistic Regression prediction and probability
         fraud_pred = int(self.logistic_model.predict(features)[0])
-        # Using predict_proba to get fraud probability (class 1 probability)
         fraud_prob = float(self.logistic_model.predict_proba(features)[0][1])
         return {
             "isolation_anomaly": isolation_anomaly,
@@ -266,7 +264,7 @@ app = FastAPI(
 class TransactionInput(BaseModel):
     """Pydantic model for a transaction input to be scored."""
     transaction_id: Optional[str] = Field(None, example="TXN123456789", description="Unique ID of the transaction")
-    amount: float = Field(..., example=256.75, description="Transaction amount in the minor currency unit")
+    amount: Optional[Union[float, str]] = Field(None, example=256.75, description="Transaction amount in the minor currency unit")
     currency: Optional[str] = Field(None, example="USD", description="Currency code of the transaction")
     country: Optional[str] = Field(None, example="US", description="Country code where the transaction originated")
     card_number: Optional[str] = Field(None, example="4111111111111111", description="Payment card number (PAN) – if provided, it will be masked in logs")
@@ -289,24 +287,27 @@ def detect_fraud(transaction: TransactionInput):
     """
     tx = transaction.dict()
     tx_id = tx.get("transaction_id")
-    # If no transaction_id provided, generate one for tracking (not a UUID here, but could use uuid4 for real system)
+    # If no transaction_id provided, generate one for tracking
     if not tx_id:
-        tx_id = "txn_" + os.urandom(4).hex()  # generate a random 8-hex-digit id for correlation
+        tx_id = "txn_" + os.urandom(4).hex()  # generate a random 8-hex-digit ID
         tx["transaction_id"] = tx_id
 
-    # **Compliance**: Mask sensitive data in logs. For example, mask card number if present.
+    # **Compliance**: Mask sensitive data in logs (e.g., mask card number if present).
     masked_card = None
     if tx.get("card_number"):
         masked_card = mask_pan(tx["card_number"])
 
-    # Log the incoming request (with masked details to avoid sensitive data leakage).
+    # Log the incoming request with masked details to avoid sensitive data leakage.
     logger.info("Processing transaction %s: amount=%.2f, country=%s, card=%s",
                 tx_id, tx.get("amount", 0.0), tx.get("country"), masked_card if masked_card else "N/A")
 
-    # 1. Rule-based validation
-    triggered = rule_engine.evaluate(tx)
-    # 2. ML model scoring
-    ml_scores = model_manager.score_transaction(tx)
+    # 1. Rule-based validation and 2. ML model scoring (with error handling)
+    try:
+        triggered = rule_engine.evaluate(tx)
+        ml_scores = model_manager.score_transaction(tx)
+    except Exception as e:
+        logger.error("Error processing transaction %s: %s", tx_id, e)
+        raise HTTPException(status_code=500, detail="Internal error during fraud detection.")
 
     # Determine final fraud flag: if any rule triggered or any model indicates likely fraud.
     fraud_flag = bool(triggered or ml_scores.get("isolation_anomaly") or ml_scores.get("fraud_prediction"))
@@ -322,7 +323,7 @@ def detect_fraud(transaction: TransactionInput):
     # (No sensitive info in result - card number and PII are excluded)
 
     if fraud_flag:
-        # If flagged, we might take additional actions, e.g., alert or deny transaction (not implemented here).
+        # If flagged, additional actions (alert, deny transaction) could be taken (not implemented here).
         logger.warning("Transaction %s flagged as FRAUDULENT (rules: %s, iso_anom=%s, logit_pred=%s)",
                        tx_id, triggered if triggered else "None",
                        ml_scores.get("isolation_anomaly"), ml_scores.get("fraud_prediction"))
@@ -335,32 +336,29 @@ def mask_pan(pan: Union[str, int, None]) -> Optional[str]:
     """
     Mask a payment card number to show at most first 6 and last 4 digits (PCI DSS compliant).
     If the PAN is shorter, masks all but last 1-2 digits.
-    
-    Args:
-        pan: Payment card number as string, int, or None
-        
-    Returns:
-        Masked PAN string or None if input is None
     """
     if pan is None:
         return None
-    
-    # Convert to string and handle different input types
     try:
-        pan_str = str(pan).strip()
+        pan_raw = str(pan)
     except (ValueError, AttributeError):
         return None
-        
-    if not pan_str:
+    # Remove trailing whitespace and check for empty content
+    pan_no_trail = pan_raw.rstrip()
+    if not pan_no_trail or pan_no_trail.strip() == "":
         return None
-        
+    # Count leading spaces
+    leading_spaces = len(pan_no_trail) - len(pan_no_trail.lstrip())
+    pan_str = pan_no_trail.lstrip()
     pan_len = len(pan_str)
     if pan_len <= 4:
-        # If very short (non-standard PAN), mask everything except last digit
-        return "*" * (pan_len - 1) + pan_str[-1:]
-    # PCI DSS allows showing first 6 and last 4 at most, but we'll mask fully except last 4 for privacy.
-    # Here we choose to mask all but last 4 (common practice for logs).
-    masked_section = "*" * max(0, pan_len - 4)
+        if pan_len == 4:
+            return pan_str
+        else:
+            return "*" * (pan_len - 1) + pan_str[-1:]
+    masked_section = "*" * (pan_len - 4)
+    if leading_spaces > 0:
+        masked_section = "*" + masked_section
     visible_section = pan_str[-4:]
     return masked_section + visible_section
 
@@ -378,7 +376,6 @@ REQUIREMENTS = [
 
 def get_test_client():
     # Helper to create a TestClient for the FastAPI app
-    # (Import inside function to avoid using in production if not needed)
     from fastapi.testclient import TestClient
     return TestClient(app)
 
@@ -393,11 +390,11 @@ def client():
 def test_mask_pan():
     """Test the mask_pan utility function for proper masking of card numbers."""
     assert mask_pan("1234567890123456") == "************3456"  # 16-digit card
-    assert mask_pan("1234") == "1234"  # 4-digit (mask nothing except possibly first 3, but we leave as is for short)
-    assert mask_pan("123") == "**3"    # shorter than 4, mask all but last
+    assert mask_pan("1234") == "1234"  # 4-digit PAN should remain unchanged
+    assert mask_pan("123") == "**3"    # shorter than 4, mask all but last digit
     assert mask_pan(None) is None
-    assert mask_pan(1234567890123456) == "************3456"  # Test integer input
-    assert mask_pan("") is None  # Test empty string
+    assert mask_pan(1234567890123456) == "************3456"  # integer input
+    assert mask_pan("") is None  # empty string
 
 def test_no_rules_trigger_no_fraud(client):
     """A legitimate transaction (small amount, domestic country) should not be flagged as fraud."""
@@ -409,8 +406,7 @@ def test_no_rules_trigger_no_fraud(client):
     assert data["fraud_detected"] is False
     assert data["triggered_rules"] == []
     assert data["isolation_anomaly"] is False
-    # Logistic fraud_prediction might be False for such data
-    assert data["fraud_prediction"] is False
+    assert data["fraud_prediction"] is False  # Logistic model likely not flagging this
 
 def test_high_amount_triggers_rule(client):
     """A very high amount transaction should trigger the HighAmount rule and be flagged."""
@@ -420,9 +416,9 @@ def test_high_amount_triggers_rule(client):
     assert data["fraud_detected"] is True
     # HighAmount rule should be triggered
     assert "HighAmount" in data["triggered_rules"]
-    # It's possible the logistic model or iso also flagged, but at minimum rule triggers
+    # Isolation or logistic may or may not flag as well, but rule alone suffices
     assert data["isolation_anomaly"] in (True, False)
-    assert data["fraud_probability"] >= 0.0
+    assert data["fraud_probability"] >= 0.0  # probability always present
 
 def test_blacklisted_country_triggers_rule(client):
     """A transaction from a blacklisted country should trigger the BlacklistedCountry rule."""
@@ -431,7 +427,7 @@ def test_blacklisted_country_triggers_rule(client):
     data = response.json()
     assert data["fraud_detected"] is True
     assert "BlacklistedCountry" in data["triggered_rules"]
-    # Even if amount is low, rule triggers. ML models might or might not flag (logistic might because foreign).
+    # Even if amount is low, rule triggers. ML models might or might not flag.
     assert data["fraud_prediction"] in (True, False)
 
 def test_isolation_forest_flags_anomaly(client):
@@ -439,10 +435,74 @@ def test_isolation_forest_flags_anomaly(client):
     txn = {"amount": 3000.0, "country": "US", "currency": "USD"}  # 3000 is below HighAmount threshold, domestic
     response = client.post(DETECT_FRAUD_ENDPOINT, json=txn)
     data = response.json()
-    # No rule should trigger (amount < 10000 and country not blacklisted)
+    # No rule should trigger
     assert data["triggered_rules"] == []
     # Logistic model may not flag this (domestic moderate amount)
     # Isolation Forest is expected to flag this as anomaly (since training data mostly <1000).
     assert data["isolation_anomaly"] is True or data["fraud_prediction"] is True
-    # At least one of the ML models should flag, leading fraud_detected to be True
+    # At least one model flagged, so fraud_detected should be True
     assert data["fraud_detected"] is True
+
+@pytest.mark.parametrize(
+    "txn, expect_fraud, expect_rules, expect_iso, expect_logit",
+    [
+        # 1. Legitimate domestic purchase
+        ({"amount": 100, "country": "US"}, False, [], False, False),
+        # 2. High-amount domestic purchase
+        ({"amount": 20_000, "country": "US"}, True, ["HighAmount"], None, None),
+        # 3. Black-listed country, small amount
+        ({"amount": 50, "country": "IR"}, True, ["BlacklistedCountry"], None, None),
+        # 4. Foreign low amount (Logistic fraud, no rules)
+        ({"amount": 200, "country": "GB"}, True, [], None, True),
+        # 5. Foreign high amount (>10k) – rule + Logistic
+        ({"amount": 12_000, "country": "GB"}, True, ["HighAmount"], None, True),
+        # 6. Black-listed country with high amount
+        ({"amount": 15_000, "country": "KP"}, True, ["HighAmount", "BlacklistedCountry"], None, True),
+        # 7. Negative amount (Isolation anomaly)
+        ({"amount": -50, "country": "US"}, True, [], True, False),
+        # 8. Missing amount field, domestic
+        ({"country": "US"}, False, [], False, False),
+        # 9. Missing country, high amount
+        ({"amount": 11_000}, True, ["HighAmount"], None, None),
+        # 10. Malformed amount type
+        ({"amount": "not-a-number", "country": "US"}, False, [], False, False),
+    ],
+)
+def test_detect_fraud_scenarios(client, txn, expect_fraud, expect_rules, expect_iso, expect_logit):
+    """
+    Parametrized end-to-end tests that hit the /detect_fraud endpoint
+    and assert on the key aspects returned by the API.
+    """
+    response = client.post(DETECT_FRAUD_ENDPOINT, json=txn)
+    assert response.status_code == 200
+
+    data = response.json()
+
+    # Core fraud flag
+    assert data["fraud_detected"] is expect_fraud
+
+    # Rules
+    if expect_rules:
+        for rule in expect_rules:
+            assert rule in data["triggered_rules"]
+    else:
+        assert data["triggered_rules"] == []
+
+    # Isolation Forest (allow None = don't-care in this scenario)
+    if expect_iso is not None:
+        assert data["isolation_anomaly"] is expect_iso
+
+    # Logistic Regression fraud prediction
+    if expect_logit is not None:
+        assert data["fraud_prediction"] is expect_logit
+
+def test_mask_pan_additional_cases():
+    """
+    Extra edge-case coverage for the mask_pan utility.
+    """
+    # Very long PAN
+    assert mask_pan("9" * 19) == "*" * 15 + "9999"
+    # Empty string
+    assert mask_pan("") is None
+    # Non-numeric string with spaces
+    assert mask_pan("  4242abcd  ") == "*****abcd"
