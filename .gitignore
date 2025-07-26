@@ -1,0 +1,15 @@
+# Ignore everything
+*
+
+# But not these files...
+!.gitignore
+!main.py
+
+# And not directories that might contain these files
+!*/
+
+# But ignore everything in subdirectories
+*/*
+
+# Except main.py in any subdirectory
+!*/main.py 
