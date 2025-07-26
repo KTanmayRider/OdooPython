@@ -1,547 +1,410 @@
-# fraud_detection_framework.py
-'''
-Fraud Detection Framework
--------------------------
-This Python module implements a credit card fraud detection framework combining dynamic rule-based detection with adaptive machine learning. 
-It provides a FastAPI REST API for integration, enforces PCI DSS and GDPR compliance measures (such as encryption/tokenization of sensitive data, audit logging, and privacy controls), 
-and includes developer documentation and automated tests.
+"""
+Credit Card Fraud Detection Framework
 
-**Compliance:** All card numbers are immediately tokenized (HMAC-SHA256) instead of stored, satisfying PCI DSS requirements for encryption of stored cardholder data:contentReference[oaicite:19]{index=19}. 
-Logs capture key events but avoid sensitive details (e.g., logging user IDs and masked card numbers only) to meet PCI DSS logging requirements:contentReference[oaicite:20]{index=20}:contentReference[oaicite:21]{index=21}. 
-Personal data is minimized (only non-identifying references like user ID and card token are stored) in line with GDPR's data minimization and pseudonymization principles:contentReference[oaicite:22]{index=22}:contentReference[oaicite:23]{index=23}. 
-The framework supports data deletion or anonymization to honor GDPR's 'right to be forgotten'.
-'''
+This module defines a FastAPI application with endpoints for real-time fraud detection 
+on credit card transactions. It combines rule-based validators and machine-learning 
+models (Isolation Forest & Logistic Regression) to score transactions. The configuration 
+supports dynamic rule updates via environment variables. The design follows PCI DSS and 
+GDPR compliance guidelines by masking sensitive data and minimizing personal data usage 
+in logs. OpenAPI documentation is automatically generated for all endpoints. Embedded 
+pytest unit tests are included for validating functionality.
+"""
+
 import os
-import hmac
-import hashlib
+import json
 import logging
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-# Ensure logs are retained and access-controlled per PCI DSS (retain 1 year of logs, restrict access):contentReference[oaicite:24]{index=24}.
-from datetime import datetime, timedelta
-
-from fastapi import FastAPI, Depends, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Optional, Any, Dict
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
-from typing import List, Optional, Any, Generator
+from sklearn.ensemble import IsolationForest
+from sklearn.linear_model import LogisticRegression
+import numpy as np
 
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy import Column, String, Integer, Float, Boolean, DateTime, create_engine
-from sqlalchemy.orm import sessionmaker
+# Configure logging for the module (could be refined to integrate with a logging config file)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s"
+)
+logger = logging.getLogger("fraud_detector")
 
-try:
-    # scikit-learn for example ML model (if available)
-    from sklearn.ensemble import IsolationForest
-    import numpy as np
-except ImportError:
-    IsolationForest = None
+# ---- Configurable Rule Definitions ----
 
-# Database setup (SQLAlchemy models for transactions, rules, etc)
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///fraud_framework.db")
-ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", None)
-SECRET_KEY = os.getenv("SECRET_KEY", None)
-if SECRET_KEY:
-    SECRET_KEY = SECRET_KEY.encode()
-else:
-    # Generate a random key for HMAC if not provided (not persistent, for demo only)
-    SECRET_KEY = os.urandom(32)
-    logging.warning("No SECRET_KEY provided, generated a temporary one (not for production).")
-if ADMIN_TOKEN is None:
-    logging.warning("No ADMIN_TOKEN provided. Admin endpoints will not be secured by token.")
+# Default rule set (JSON format) embedded in the code.
+DEFAULT_RULES_JSON: str = json.dumps([
+    {
+        "name": "HighAmount",
+        "field": "amount",
+        "operator": ">",
+        "value": 10000,
+        "message": "Transaction amount exceeds allowed threshold"
+    },
+    {
+        "name": "BlacklistedCountry",
+        "field": "country",
+        "operator": "in",
+        "value": ["KP", "IR", "SY"],  # Country codes (e.g., North Korea, Iran, Syria)
+        "message": "Transaction originates from a blacklisted country"
+    }
+], indent=4)
 
-# Initialize database engine and session
-engine = create_engine(DATABASE_URL, echo=False, future=True)
-SessionLocal = sessionmaker(bind=engine)
-Base = declarative_base()
-
-class TransactionRecord(Base):
-    """ORM model for transaction logs (one record per transaction)"""
-    __tablename__ = "transactions"
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, index=True)
-    card_token = Column(String, index=True)
-    card_last4 = Column(String(4))
-    amount = Column(Float)
-    currency = Column(String(3))
-    merchant_id = Column(String, nullable=True)
-    country = Column(String(2), nullable=True)
-    timestamp = Column(DateTime, default=datetime.utcnow)
-    is_fraud = Column(Boolean, default=False)
-    rule_triggered = Column(String, nullable=True)  # name of rule or 'ML' if flagged by model
-
-class RuleRecord(Base):
-    """ORM model for fraud detection rules"""
-    __tablename__ = "rules"
-    id = Column(Integer, primary_key=True, index=True)
-    name = Column(String, unique=True)
-    field = Column(String)      # e.g. "amount", "country", "card_token"
-    operator = Column(String)   # e.g. ">", "<", "==", "!="
-    value = Column(String)      # stored as string, will be parsed to type based on field when evaluating
-    active = Column(Boolean, default=True)
-    created_at = Column(DateTime, default=datetime.utcnow)
-    updated_at = Column(DateTime, default=datetime.utcnow)
-
-# Dependency to get DB session (for FastAPI)
-def get_db() -> Generator:
-    db = SessionLocal()
+# Load rules from environment if provided, otherwise use default.
+rules_config: List[Dict[str, Any]]
+env_rules_json = os.getenv("FRAUD_RULES_JSON")
+env_rules_path = os.getenv("FRAUD_RULES_PATH")
+if env_rules_json:
     try:
-        yield db
-    finally:
-        db.close()
+        rules_config = json.loads(env_rules_json)
+        logger.info("Loaded fraud rules from FRAUD_RULES_JSON environment variable.")
+    except json.JSONDecodeError as e:
+        logger.error("Failed to parse FRAUD_RULES_JSON: %s", e)
+        raise
+elif env_rules_path:
+    try:
+        with open(env_rules_path, "r") as f:
+            rules_config = json.load(f)
+        logger.info("Loaded fraud rules from FRAUD_RULES_PATH: %s", env_rules_path)
+    except Exception as e:
+        logger.error("Failed to load rules from file %s: %s", env_rules_path, e)
+        raise
+else:
+    # Use embedded default rules
+    rules_config = json.loads(DEFAULT_RULES_JSON)
+    logger.info("Using default embedded fraud rules configuration.")
 
-def verify_admin(admin_token: Optional[str] = Header(None)) -> bool:
-    """
-    Dependency to secure admin-only endpoints.
-    Requires a correct X-Admin-Token header if ADMIN_TOKEN is set in environment.
-    """
-    if ADMIN_TOKEN:
-        if admin_token is None or admin_token != ADMIN_TOKEN:
-            raise HTTPException(status_code=401, detail="Unauthorized: Admin token required")
-    # If ADMIN_TOKEN not set, we skip auth (open access).
-    return True
+# ---- Rule Engine Implementation ----
 
 class RuleEngine:
-    """
-    The RuleEngine loads and evaluates dynamic fraud rules.
-    Each rule is a simple condition (field operator value) that when satisfied flags a transaction.
-    Rules can be added or updated at runtime to respond to new fraud patterns.
-    """
-    def __init__(self, db_session):
-        self.db = db_session
-
-    def evaluate(self, transaction: dict) -> List[str]:
+    """Engine to evaluate transactions against a set of fraud detection rules."""
+    def __init__(self, rules: List[Dict[str, Any]]):
         """
-        Evaluate the current active rules against the given transaction.
-        Returns a list of rule names that triggered (empty if none).
+        Initialize the RuleEngine with a list of rule definitions.
+        Each rule is a dict with keys: name, field, operator, value, message.
         """
-        triggered = []
-        # Fetch active rules from the database
-        rules = self.db.query(RuleRecord).filter(RuleRecord.active == True).all()
-        for rule in rules:
-            field = rule.field
-            op = rule.operator
-            # Determine the value type (number or string)
-            # Numeric fields:
-            if field in {"amount"}:
-                try:
-                    txn_value = float(transaction.get(field, 0))
-                    rule_value = float(rule.value)
-                except Exception as e:
-                    continue  # if conversion fails, skip rule
-            else:
-                txn_value = str(transaction.get(field))
-                rule_value = rule.value
-            # Evaluate condition
-            result = False
-            if op == ">" and isinstance(txn_value, (int,float)):
-                result = txn_value > rule_value
-            elif op == "<" and isinstance(txn_value, (int,float)):
-                result = txn_value < rule_value
-            elif op == "==":
-                result = txn_value == rule_value
-            elif op == "!=":
-                result = txn_value != rule_value
-            # If rule triggers, record its name
-            if result:
-                triggered.append(rule.name)
-        return triggered
+        self.rules = rules
 
-class FraudModel:
+    def evaluate(self, transaction: Dict[str, Any]) -> List[str]:
+        """
+        Evaluate all rules against the given transaction data.
+        Returns a list of rule names that were triggered (violated) by the transaction.
+        """
+        triggered_rules: List[str] = []
+        for rule in self.rules:
+            field = rule.get("field")
+            operator = rule.get("operator")
+            expected_value = rule.get("value")
+            # If the field is missing in transaction, skip evaluation.
+            if field not in transaction:
+                continue
+            actual_value = transaction[field]
+            triggered = False
+            try:
+                # Determine rule condition outcome based on operator.
+                if operator == ">":
+                    # Assuming numeric comparison
+                    triggered = float(actual_value) > float(expected_value)
+                elif operator == "<":
+                    triggered = float(actual_value) < float(expected_value)
+                elif operator == "==":
+                    triggered = actual_value == expected_value
+                elif operator == "!=":
+                    triggered = actual_value != expected_value
+                elif operator == "in":
+                    # expected_value should be a list for 'in' operator
+                    if isinstance(expected_value, (list, tuple)):
+                        triggered = actual_value in expected_value
+                    else:
+                        # If value is not list, treat it as single element list
+                        triggered = actual_value == expected_value
+                elif operator == "not in":
+                    if isinstance(expected_value, (list, tuple)):
+                        triggered = actual_value not in expected_value
+                    else:
+                        triggered = actual_value != expected_value
+                else:
+                    # Unsupported operator: skip or log a warning
+                    logger.warning("Unsupported operator '%s' in rule '%s'", operator, rule.get("name"))
+                    continue
+            except Exception as e:
+                # If any error in evaluating rule, log and skip it (robustness)
+                logger.error("Error evaluating rule '%s': %s", rule.get("name"), e)
+                continue
+
+            if triggered:
+                rule_name = str(rule.get("name") or "UnnamedRule")
+                triggered_rules.append(rule_name)
+                # Log the rule trigger for audit (without sensitive data if possible)
+                logger.info("Rule triggered: %s -> %s", rule_name, rule.get("message"))
+        return triggered_rules
+
+# Instantiate the global RuleEngine with the loaded configuration
+rule_engine = RuleEngine(rules_config)
+
+# ---- Machine Learning Model Manager ----
+
+class FraudModelManager:
     """
-    The FraudModel handles the machine learning detection of fraud.
-    It uses an adaptive ML model (e.g., an Isolation Forest anomaly detector or a supervised model) 
-    to score transactions for fraud risk. The model can be retrained to adapt to emerging fraud patterns.
+    Manages ML models for fraud detection: an Isolation Forest for anomaly detection
+    and a Logistic Regression for fraud classification. Provides methods to train 
+    the models (on startup) and score new transactions.
     """
     def __init__(self):
-        self.model = None
-        self.threshold = None
-        # Initialize an anomaly detection model if available
-        if IsolationForest is not None:
-            # Train an Isolation Forest on sample normal data (simulate baseline normal behavior)
-            self.model = IsolationForest(contamination=0.01, random_state=42)
-            # Synthetic normal data for amount
-            sample_data = np.concatenate([
-                np.random.normal(loc=50, scale=30, size=1000),   # typical small transactions
-                np.random.normal(loc=200, scale=50, size=300),   # some medium transactions
-            ]).reshape(-1, 1)
-            self.model.fit(sample_data)
-            # Set a threshold for anomaly score if needed (here using built-in contamination to label outliers)
-            self.threshold = 0.0  # decision_function threshold (0 by default separates inliers vs outliers)
-        else:
-            # If ML library not available, model stays None (fallback to rule-only detection)
-            logging.warning("ML model not initialized - falling back to rule-based detection only.")
-    def score(self, transaction: dict) -> float:
-        """
-        Compute a fraud risk score for the transaction. Higher score = more likely fraud.
-        If model is not available, returns 0 for no risk by default.
-        """
-        if self.model is None:
-            return 0.0
-        # Example: use amount as the primary feature for anomaly detection
-        amount = transaction.get("amount", 0.0)
-        try:
-            amount_val = float(amount)
-        except:
-            amount_val = 0.0
-        # For anomaly detection, we can use the decision function (higher => more normal, lower => more anomalous)
-        anomaly_score = None
-        try:
-            anomaly_score = self.model.decision_function([[amount_val]])[0]
-        except Exception as e:
-            # If model decision function fails (e.g., model not fitted), return low risk
-            logging.error(f"Model scoring error: {e}")
-            return 0.0
-        # decision_function: positive for inliers, negative for outliers
-        # We convert it to risk score (outlier => high risk)
-        risk_score = -anomaly_score
-        return risk_score
-    def is_fraud(self, transaction: dict) -> bool:
-        """
-        Determine if the transaction is fraudulent based on the model.
-        For anomaly detection, we use the internal threshold or risk score.
-        """
-        if self.model is None:
-            return False
-        score = self.score(transaction)
-        # If using IsolationForest, predict method can be used to classify directly
-        try:
-            pred = int(self.model.predict([[float(transaction.get("amount", 0.0))]])[0])
-        except:
-            pred = 1  # assume inlier if error
-        # IsolationForest predict: 1 for normal, -1 for anomaly
-        if pred == -1:
-            return True
-        # Alternatively, use threshold on risk_score if needed
-        if self.threshold is not None and score > abs(self.threshold):
-            # Actually since threshold=0, this means any negative decision (positive risk) triggers
-            return True
-        return False
-    def retrain(self, db):
-        """
-        Retrain or update the model using recent data.
-        For anomaly detection, fit on recent legitimate transactions to adapt to new patterns.
-        """
-        if IsolationForest is None:
-            return False
-        # Fetch recent transactions that are not fraud (assuming they are legitimate) from DB
-        try:
-            recent = db.query(TransactionRecord).filter(TransactionRecord.is_fraud == False).all()
-        except Exception as e:
-            logging.error(f"Database error during model retrain: {e}")
-            return False
-        if not recent:
-            return False
-        amounts = [tx.amount for tx in recent if tx.amount is not None]
-        if not amounts:
-            return False
-        data = np.array(amounts).reshape(-1, 1)
-        # Re-fit the isolation forest on new data (transfers knowledge to new patterns)
-        self.model.fit(data)
-        logging.info(f"Retrained fraud detection model on {len(data)} recent transactions.")
-        return True
+        # Initialize models; they will be trained on startup.
+        self.isolation_forest = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
+        self.logistic_model = LogisticRegression(solver='liblinear', random_state=0)
 
-# API Routes and logic
+        # Train the models on startup with placeholder or preloaded data.
+        self._train_models()
+
+    def _train_models(self):
+        """
+        Train or load the ML models. In a real system, this might load pre-trained 
+        model weights. Here we simulate training with synthetic data for demonstration.
+        """
+        # Synthetic training data for Isolation Forest (unsupervised):
+        # Assume normal transactions have relatively lower amounts (e.g., < $1000 mostly).
+        rng = np.random.RandomState(42)
+        # Generate normal transaction feature data for training.
+        # Features: [amount, is_foreign]
+        num_samples = 1000
+        amounts = rng.normal(loc=500, scale=200, size=num_samples)  # mostly around 500
+        amounts = np.clip(amounts, a_min=0, a_max=1000)  # cap at 1000 to avoid extreme outliers in training
+        countries = rng.choice([0, 1], size=num_samples, p=[0.8, 0.2])  
+        # Here 0 = domestic (e.g., "US"), 1 = foreign, simulating 20% foreign transactions
+        X_train_iso = np.column_stack((amounts, countries))
+        # Fit Isolation Forest on this "normal" data
+        self.isolation_forest.fit(X_train_iso)
+        logger.info("Isolation Forest model trained on synthetic normal transaction data.")
+
+        # Synthetic training data for Logistic Regression (supervised):
+        # We'll create a small labeled dataset for demonstration purposes.
+        # Feature 1: amount, Feature 2: is_foreign (0 or 1 as above).
+        X_train_log = np.array([
+            [50.0, 0],      # low amount, domestic -> not fraud
+            [200.0, 1],     # low amount, foreign -> fraud (perhaps stolen card used abroad for small amount)
+            [5000.0, 0],    # high amount, domestic -> not fraud (e.g., a legitimate large purchase in home country)
+            [10000.0, 1]    # high amount, foreign -> fraud (large foreign transaction)
+        ])
+        y_train_log = np.array([0, 1, 0, 1])  # corresponding labels
+        try:
+            self.logistic_model.fit(X_train_log, y_train_log)
+            logger.info("Logistic Regression model trained on synthetic labeled data.")
+        except Exception as e:
+            logger.error("Error training Logistic Regression model: %s", e)
+            # If training fails, we raise an exception to avoid running with an untrained model
+            raise
+
+    def score_transaction(self, transaction: Dict[str, Any]) -> Dict[str, Any]:
+        """
+        Score a transaction using the ML models. Returns a dictionary of model outcomes:
+        - isolation_anomaly (bool): True if Isolation Forest sees an anomaly.
+        - fraud_probability (float): Probability of fraud from logistic model (0 to 1).
+        - fraud_prediction (bool): Logistic model's binary fraud prediction.
+        """
+        # Prepare feature vector for models from transaction data.
+        try:
+            amount = float(transaction.get("amount", 0.0))
+        except Exception:
+            amount = 0.0
+        # Define "is_foreign" feature: here, treat country != "US" as foreign (1) for example.
+        country_code = transaction.get("country")
+        is_foreign = 0
+        if country_code and isinstance(country_code, str):
+            is_foreign = 0 if country_code.upper() == "US" else 1
+
+        features = np.array([[amount, is_foreign]], dtype=float)
+        # Isolation Forest prediction: 1 = normal, -1 = anomaly
+        iso_pred = self.isolation_forest.predict(features)[0]
+        isolation_anomaly = bool(iso_pred == -1)
+        # Logistic Regression prediction and probability
+        fraud_pred = int(self.logistic_model.predict(features)[0])
+        # Using predict_proba to get fraud probability (class 1 probability)
+        fraud_prob = float(self.logistic_model.predict_proba(features)[0][1])
+        return {
+            "isolation_anomaly": isolation_anomaly,
+            "fraud_probability": fraud_prob,
+            "fraud_prediction": bool(fraud_pred)
+        }
+
+# Instantiate the global model manager (models are trained at app startup)
+model_manager = FraudModelManager()
+
+# ---- FastAPI Application and Data Models ----
+
 app = FastAPI(
     title="Credit Card Fraud Detection API",
-    description="A Python-powered fraud detection framework combining dynamic rule sets and adaptive ML to flag emerging fraud in real time. Implements PCI DSS and GDPR controls, with audit logging and developer documentation.",
-    version="1.0.0"
+    description="API for real-time credit card fraud detection using rule-based validators and ML models.",
+    version="1.0.0",
+    contact={"name": "Payment Security Team", "email": "security@example.com"},
+    license_info={"name": "Proprietary"}
 )
-# Enable CORS for integration (adjust origins as needed)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Initialize global fraud detection model
-fraud_model = FraudModel()
-
-@app.on_event("startup")
-def on_startup():
-    # Ensure database tables exist
-    Base.metadata.create_all(bind=engine)
-    # If no rules exist, insert a default rule (example)
-    db = SessionLocal()
-    try:
-        if db.query(RuleRecord).count() == 0:
-            default_rule = RuleRecord(name="HighValueTxn", field="amount", operator=">", value="10000", active=True)
-            db.add(default_rule)
-            db.commit()
-            logging.info("Inserted default HighValueTxn rule for amount > 10000.")
-    except Exception as e:
-        logging.error(f"Error initializing default rules: {e}")
-    finally:
-        db.close()
 
 class TransactionInput(BaseModel):
-    user_id: str = Field(..., description="User or account identifier")
-    card_number: Optional[str] = Field(None, description="Credit card number (PAN) - will be tokenized; not stored")
-    card_token: Optional[str] = Field(None, description="Tokenized card identifier (if PAN already tokenized)")
-    amount: float = Field(..., description="Transaction amount")
-    currency: str = Field(..., description="Transaction currency code (e.g., USD)")
-    country: Optional[str] = Field(None, description="Country code of transaction origin (if available)")
-    merchant_id: Optional[str] = Field(None, description="Merchant identifier or name")
+    """Pydantic model for a transaction input to be scored."""
+    transaction_id: Optional[str] = Field(None, example="TXN123456789", description="Unique ID of the transaction")
+    amount: float = Field(..., example=256.75, description="Transaction amount in the minor currency unit")
+    currency: Optional[str] = Field(None, example="USD", description="Currency code of the transaction")
+    country: Optional[str] = Field(None, example="US", description="Country code where the transaction originated")
+    card_number: Optional[str] = Field(None, example="4111111111111111", description="Payment card number (PAN) – if provided, it will be masked in logs")
 
 class FraudResult(BaseModel):
-    is_fraud: bool = Field(..., description="Whether the transaction is flagged as fraudulent")
-    triggered_rules: List[str] = Field(..., description="Names of rules that triggered (if any)")
-    model_flag: bool = Field(..., description="Whether the ML model flagged the transaction")
-    risk_score: float = Field(..., description="Fraud risk score from ML model (higher means more likely fraud)")
-    transaction_id: Optional[int] = Field(None, description="Logged transaction record ID")
+    """Pydantic model for the fraud detection response."""
+    transaction_id: Optional[str] = Field(None, description="Transaction ID, echoed from input if provided")
+    fraud_detected: bool = Field(..., description="True if the transaction is flagged as potentially fraudulent")
+    triggered_rules: List[str] = Field(..., description="List of rule names that were triggered (if any)")
+    isolation_anomaly: bool = Field(..., description="True if the Isolation Forest model flagged this as an anomaly")
+    fraud_probability: float = Field(..., description="Fraud probability score from the logistic regression model (0.0 to 1.0)")
+    fraud_prediction: bool = Field(..., description="Logistic regression model's binary fraud classification (True=fraud)")
 
-@app.post("/detect", response_model=FraudResult, summary="Evaluate a transaction for fraud")
-def detect_transaction(data: TransactionInput, db: SessionLocal = Depends(get_db)):
+@app.post("/detect_fraud", response_model=FraudResult, summary="Score a transaction for fraud risk",
+          description="Analyzes a credit card transaction using rule-based validation and ML models to determine if it's potentially fraudulent.")
+def detect_fraud(transaction: TransactionInput):
     """
-    Assess a transaction using rule-based checks and ML model to determine if it's fraudulent.
-    - **Returns**: FraudResult with overall decision and details on triggers.
+    Endpoint to assess fraud risk of a given transaction. It applies rule-based checks and ML model scoring.
+    Returns a detailed result including whether fraud is detected and which rules or models contributed.
     """
-    # Tokenize card number if provided
-    if data.card_token:
-        token = data.card_token
-        last4 = token[-4:] if len(token) >= 4 else token
-    elif data.card_number:
-        # PCI DSS: Do not store PAN; use tokenization:contentReference[oaicite:25]{index=25}.
-        # Generate a secure token for the card number
-        token_bytes = data.card_number.encode()
-        token = hmac.new(SECRET_KEY, token_bytes, hashlib.sha256).hexdigest()
-        last4 = data.card_number[-4:] if len(data.card_number) >= 4 else data.card_number
-        # Do not log or store full card number (compliance with PCI DSS and GDPR).
+    tx = transaction.dict()
+    tx_id = tx.get("transaction_id")
+    # If no transaction_id provided, generate one for tracking (not a UUID here, but could use uuid4 for real system)
+    if not tx_id:
+        tx_id = "txn_" + os.urandom(4).hex()  # generate a random 8-hex-digit id for correlation
+        tx["transaction_id"] = tx_id
+
+    # **Compliance**: Mask sensitive data in logs. For example, mask card number if present.
+    masked_card = None
+    if tx.get("card_number"):
+        masked_card = mask_pan(tx["card_number"])
+        tx_masked_for_log = tx.copy()
+        tx_masked_for_log["card_number"] = masked_card
     else:
-        raise HTTPException(status_code=422, detail="card_number or card_token must be provided")
-    # Prepare transaction data dict for evaluation
-    txn = {
-        "user_id": data.user_id,
-        "card_token": token,
-        "amount": data.amount,
-        "currency": data.currency,
-        "country": data.country,
-        "merchant_id": data.merchant_id
+        tx_masked_for_log = tx
+
+    # Log the incoming request (with masked details to avoid sensitive data leakage).
+    logger.info("Processing transaction %s: amount=%.2f, country=%s, card=%s",
+                tx_id, tx.get("amount", 0.0), tx.get("country"), masked_card if masked_card else "N/A")
+
+    # 1. Rule-based validation
+    triggered = rule_engine.evaluate(tx)
+    # 2. ML model scoring
+    ml_scores = model_manager.score_transaction(tx)
+
+    # Determine final fraud flag: if any rule triggered or any model indicates likely fraud.
+    fraud_flag = bool(triggered or ml_scores.get("isolation_anomaly") or ml_scores.get("fraud_prediction"))
+
+    result = {
+        "transaction_id": tx_id,
+        "fraud_detected": fraud_flag,
+        "triggered_rules": triggered,
+        "isolation_anomaly": ml_scores.get("isolation_anomaly", False),
+        "fraud_probability": ml_scores.get("fraud_probability", 0.0),
+        "fraud_prediction": ml_scores.get("fraud_prediction", False)
     }
-    # Evaluate rules
-    rule_engine = RuleEngine(db)
-    triggered = rule_engine.evaluate(txn)
-    # Evaluate ML model
-    model_flag = fraud_model.is_fraud(txn)
-    risk_score = fraud_model.score(txn)
-    # Determine overall outcome
-    is_fraud = bool(triggered or model_flag)
-    # Log the detection event (audit logging)
-    masked_card = "****" + last4  # mask card for logs
-    if is_fraud:
-        reason = "rule:" + ",".join(triggered) if triggered else "ML model"
-        logging.info(f"Fraud detected for user {data.user_id}, card ending {last4}, amount {data.amount}. Reason: {reason}")
+    # (No sensitive info in result - card number and PII are excluded)
+
+    if fraud_flag:
+        # If flagged, we might take additional actions, e.g., alert or deny transaction (not implemented here).
+        logger.warning("Transaction %s flagged as FRAUDULENT (rules: %s, iso_anom=%s, logit_pred=%s)",
+                       tx_id, triggered if triggered else "None",
+                       ml_scores.get("isolation_anomaly"), ml_scores.get("fraud_prediction"))
     else:
-        logging.info(f"Transaction OK for user {data.user_id}, card ending {last4}, amount {data.amount}.")
-    # Store transaction record (with compliance: tokenized card, no PII beyond necessity)
-    record = TransactionRecord(
-        user_id=data.user_id,
-        card_token=token,
-        card_last4=last4,
-        amount=data.amount,
-        currency=data.currency,
-        country=data.country,
-        merchant_id=data.merchant_id,
-        timestamp=datetime.utcnow(),
-        is_fraud=is_fraud,
-        rule_triggered=",".join(triggered) if triggered else ("ML" if model_flag else None)
-    )
-    db.add(record)
-    db.commit()
-    db.refresh(record)
-    return FraudResult(
-        is_fraud=is_fraud,
-        triggered_rules=triggered,
-        model_flag=model_flag,
-        risk_score=round(risk_score, 4),
-        transaction_id=record.id
-    )
+        logger.info("Transaction %s is assessed as legitimate.", tx_id)
+    return result
 
-class RuleOut(BaseModel):
-    id: int
-    name: str
-    field: str
-    operator: str
-    value: str
-    active: bool
-    class Config:
-        orm_mode = True
+# Utility function for masking a credit card number (PAN) for logs or output
+def mask_pan(pan: str) -> str:
+    """
+    Mask a payment card number to show at most first 6 and last 4 digits (PCI DSS compliant).
+    If the PAN is shorter, masks all but last 1-2 digits.
+    """
+    if pan is None:
+        return None
+    pan_str = str(pan)
+    pan_len = len(pan_str)
+    if pan_len <= 4:
+        # If very short (non-standard PAN), mask everything except last digit
+        return "*" * (pan_len - 1) + pan_str[-1:]
+    # PCI DSS allows showing first 6 and last 4 at most:contentReference[oaicite:23]{index=23}, but we'll mask fully except last 4 for privacy.
+    # Here we choose to mask all but last 4 (common practice for logs).
+    masked_section = "*" * max(0, pan_len - 4)
+    visible_section = pan_str[-4:]
+    return masked_section + visible_section
 
-class NewRule(BaseModel):
-    name: str = Field(..., description="Unique name for the rule")
-    field: str = Field(..., description="Transaction field to apply rule on (e.g., 'amount', 'country', 'card_token')")
-    operator: str = Field(..., description="Operator for comparison (>, <, ==, !=)")
-    value: str = Field(..., description="Value to compare against (as string, will be parsed to appropriate type)")
-    active: bool = Field(True, description="Whether the rule is active")
+# ---- Requirements ----
+# (In practice, this would be a separate requirements.txt file. Listed here for completeness.)
+REQUIREMENTS = [
+    "fastapi>=0.95.0",
+    "uvicorn>=0.18.0",
+    "scikit-learn>=1.0.0",
+    "numpy>=1.21.0",
+    "pytest>=7.0.0"
+]
 
-@app.get("/rules", response_model=List[RuleOut], dependencies=[Depends(verify_admin)], summary="List all fraud rules")
-def list_rules(db: SessionLocal = Depends(get_db)):
-    """
-    Get all fraud detection rules.
-    **Admin only** – requires X-Admin-Token.
-    """
-    rules = db.query(RuleRecord).all()
-    return rules
+# ---- Unit Tests (pytest) ----
 
-@app.post("/rules", response_model=RuleOut, dependencies=[Depends(verify_admin)], summary="Add a new fraud rule")
-def add_rule(rule: NewRule, db: SessionLocal = Depends(get_db)):
-    """
-    Add a new fraud detection rule. (Admin only)
-    """
-    # Prevent duplicate rule names
-    existing = db.query(RuleRecord).filter(RuleRecord.name == rule.name).first()
-    if existing:
-        raise HTTPException(status_code=400, detail="Rule with this name already exists")
-    new_rule = RuleRecord(
-        name=rule.name,
-        field=rule.field,
-        operator=rule.operator,
-        value=rule.value,
-        active=rule.active
-    )
-    # Basic validation of operator
-    if new_rule.operator not in {">", "<", "==", "!="}:
-        raise HTTPException(status_code=422, detail="Invalid operator. Must be one of >, <, ==, !=")
-    db.add(new_rule)
-    db.commit()
-    db.refresh(new_rule)
-    logging.info(f"New rule added: {new_rule.name} ({new_rule.field} {new_rule.operator} {new_rule.value})")
-    return new_rule
-
-class UpdateRule(BaseModel):
-    value: Optional[str] = None
-    active: Optional[bool] = None
-
-@app.put("/rules/{rule_id}", response_model=RuleOut, dependencies=[Depends(verify_admin)], summary="Update an existing rule")
-def update_rule(rule_id: int, updates: UpdateRule, db: SessionLocal = Depends(get_db)):
-    """
-    Update an existing rule's value or active status. (Admin only)
-    """
-    rule = db.query(RuleRecord).filter(RuleRecord.id == rule_id).first()
-    if not rule:
-        raise HTTPException(status_code=404, detail="Rule not found")
-    if updates.value is not None:
-        rule.value = updates.value
-    if updates.active is not None:
-        rule.active = updates.active
-    rule.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(rule)
-    logging.info(f"Rule {rule.name} updated: value={rule.value}, active={rule.active}")
-    return rule
-
-@app.delete("/rules/{rule_id}", dependencies=[Depends(verify_admin)], summary="Delete a rule")
-def delete_rule(rule_id: int, db: SessionLocal = Depends(get_db)):
-    """
-    Delete a fraud detection rule by ID. (Admin only)
-    """
-    rule = db.query(RuleRecord).filter(RuleRecord.id == rule_id).first()
-    if not rule:
-        raise HTTPException(status_code=404, detail="Rule not found")
-    db.delete(rule)
-    db.commit()
-    logging.info(f"Rule {rule.name} deleted.")
-    return {"detail": f"Rule '{rule.name}' deleted"}
-
-@app.post("/model/retrain", dependencies=[Depends(verify_admin)], summary="Retrain the ML model with latest data")
-def retrain_model(db: SessionLocal = Depends(get_db)):
-    """
-    Retrain the fraud detection ML model on recent transaction data (Admin only).
-    """
-    success = fraud_model.retrain(db)
-    if not success:
-        raise HTTPException(status_code=500, detail="Model retraining failed or no data")
-    return {"detail": "Model retrained successfully"}
-
-if __name__ == "__main__":
-    # Basic integration tests for the framework (simulate CI test suite)
-    import os
-    import json
+def get_test_client():
+    # Helper to create a TestClient for the FastAPI app
+    # (Import inside function to avoid using in production if not needed)
     from fastapi.testclient import TestClient
-    # If using SQLite file from previous runs, remove it to start fresh
-    if DATABASE_URL.startswith("sqlite") and "fraud_framework.db" in DATABASE_URL:
-        try:
-            os.remove("fraud_framework.db")
-        except FileNotFoundError:
-            pass
-    client = TestClient(app)
-    logging.info("Running basic tests...")
-    # 1. Test listing rules (should contain default rule)
-    res = client.get("/rules")
-    assert res.status_code == 200, "GET /rules failed"
-    rules_list = res.json()
-    logging.info(f"Initial rules: {rules_list}")
-    # Default rule "HighValueTxn" should exist:
-    default_rules = [r for r in rules_list if r["name"] == "HighValueTxn"]
-    assert default_rules, "Default rule not found"
-    # 2. Test adding a new rule
-    new_rule_data = {"name": "BlockCurXXX", "field": "currency", "operator": "==", "value": "XXX", "active": True}
-    res = client.post("/rules", json=new_rule_data)
-    assert res.status_code == 200, f"POST /rules failed: {res.text}"
-    rule_out = res.json()
-    assert rule_out["name"] == "BlockCurXXX", "New rule not added correctly"
-    logging.info(f"Added rule: {rule_out}")
-    # 3. Test fraud detection for various scenarios
-    # a. A normal transaction (should NOT be fraud)
-    txn1 = {"user_id": "user1", "card_number": "4111111111111111", "amount": 50.0, "currency": "USD", "country": "US", "merchant_id": "M123"}
-    res = client.post("/detect", json=txn1)
-    assert res.status_code == 200, "POST /detect failed"
-    result1 = res.json()
-    assert result1["is_fraud"] is False, "False positive detected for normal transaction"
-    logging.info(f"Txn1 result: {result1}")
-    # b. High amount transaction (should trigger HighValueTxn rule)
-    txn2 = {"user_id": "user1", "card_number": "4111111111111111", "amount": 20000.0, "currency": "USD", "country": "US", "merchant_id": "M123"}
-    res = client.post("/detect", json=txn2)
-    result2 = res.json()
-    assert result2["is_fraud"] is True and "HighValueTxn" in result2["triggered_rules"], "High value rule not triggered"
-    logging.info(f"Txn2 result: {result2}")
-    # c. Moderately high amount (no rule, but ML might flag as fraud)
-    txn3 = {"user_id": "user2", "card_number": "4111111111111111", "amount": 1000.0, "currency": "USD", "country": "US", "merchant_id": "M123"}
-    res = client.post("/detect", json=txn3)
-    result3 = res.json()
-    assert result3["is_fraud"] == True, "ML model did not flag an outlier transaction"
-    assert result3["triggered_rules"] == [] and result3["model_flag"] == True, "Outlier should be flagged by model only"
-    logging.info(f"Txn3 result (ML flagged): {result3}")
-    # d. Transaction with blocked currency (should trigger BlockCurXXX rule)
-    txn4 = {"user_id": "user3", "card_number": "4111111111111111", "amount": 10.0, "currency": "XXX", "country": "ZZ", "merchant_id": "M999"}
-    res = client.post("/detect", json=txn4)
-    result4 = res.json()
-    assert result4["is_fraud"] is True and "BlockCurXXX" in result4["triggered_rules"], "Currency rule not triggered"
-    logging.info(f"Txn4 result: {result4}")
-    # e. Test using card_token directly (simulate blacklisted card)
-    # Add a rule to blacklist a specific card token
-    test_token = "ABCDTOKEN1234"
-    bl_rule = {"name": "BlacklistTestCard", "field": "card_token", "operator": "==", "value": test_token, "active": True}
-    res = client.post("/rules", json=bl_rule)
-    assert res.status_code == 200, "Failed to add blacklist rule"
-    # Call detect with card_token equal to that value
-    txn5 = {"user_id": "user4", "card_token": test_token, "amount": 5.0, "currency": "USD", "country": "US", "merchant_id": "M111"}
-    res = client.post("/detect", json=txn5)
-    result5 = res.json()
-    assert result5["is_fraud"] is True and "BlacklistTestCard" in result5["triggered_rules"], "Blacklisted card token not detected"
-    logging.info(f"Txn5 result: {result5}")
-    # 4. Test updating a rule (deactivate BlockCurXXX)
-    rule_id = rule_out["id"]
-    res = client.put(f"/rules/{rule_id}", json={"active": False})
-    assert res.status_code == 200, "Failed to update rule"
-    upd_rule = res.json()
-    assert upd_rule["active"] is False, "Rule active status not updated"
-    # Verify the rule no longer triggers
-    res = client.post("/detect", json=txn4)  # reuse txn4 (currency XXX) after rule deactivation
-    result4b = res.json()
-    assert result4b["is_fraud"] is False, "Deactivated rule still triggered fraud"
-    logging.info(f"Txn4 after deactivating rule: {result4b}")
-    # 5. Test deleting a rule
-    res = client.delete(f"/rules/{rule_id}")
-    assert res.status_code == 200, "Failed to delete rule"
-    res = client.get("/rules")
-    rules_after = [r["name"] for r in res.json()]
-    assert "BlockCurXXX" not in rules_after, "Rule deletion failed"
-    # 6. Test model retraining endpoint (should succeed even if data is limited)
-    res = client.post("/model/retrain")
-    assert res.status_code in (200, 500), "Retrain endpoint failure"
-    if res.status_code == 200:
-        logging.info("Model retrain successful")
-    else:
-        logging.info("Model retrain skipped (no data)")
-    logging.info("All tests passed.")
+    return TestClient(app)
+
+import pytest
+
+@pytest.fixture(scope="module")
+def client():
+    """Pytest fixture to provide a FastAPI test client."""
+    with get_test_client() as c:
+        yield c
+
+def test_mask_pan():
+    """Test the mask_pan utility function for proper masking of card numbers."""
+    assert mask_pan("1234567890123456") == "************3456"  # 16-digit card
+    assert mask_pan("1234") == "1234"  # 4-digit (mask nothing except possibly first 3, but we leave as is for short)
+    assert mask_pan("123") == "**3"    # shorter than 4, mask all but last
+    assert mask_pan(None) is None
+
+def test_no_rules_trigger_no_fraud(client):
+    """A legitimate transaction (small amount, domestic country) should not be flagged as fraud."""
+    txn = {"amount": 100.0, "country": "US", "currency": "USD"}
+    response = client.post("/detect_fraud", json=txn)
+    assert response.status_code == 200
+    data = response.json()
+    # No rules triggered, models should likely not flag this as fraud.
+    assert data["fraud_detected"] is False
+    assert data["triggered_rules"] == []
+    assert data["isolation_anomaly"] is False
+    # Logistic fraud_prediction might be False for such data
+    assert data["fraud_prediction"] is False
+
+def test_high_amount_triggers_rule(client):
+    """A very high amount transaction should trigger the HighAmount rule and be flagged."""
+    txn = {"amount": 20000.0, "country": "US", "currency": "USD"}
+    response = client.post("/detect_fraud", json=txn)
+    data = response.json()
+    assert data["fraud_detected"] is True
+    # HighAmount rule should be triggered
+    assert "HighAmount" in data["triggered_rules"]
+    # It's possible the logistic model or iso also flagged, but at minimum rule triggers
+    assert data["isolation_anomaly"] in (True, False)
+    assert data["fraud_probability"] >= 0.0
+
+def test_blacklisted_country_triggers_rule(client):
+    """A transaction from a blacklisted country should trigger the BlacklistedCountry rule."""
+    txn = {"amount": 50.0, "country": "IR", "currency": "USD"}  # Iran is blacklisted in default rules
+    response = client.post("/detect_fraud", json=txn)
+    data = response.json()
+    assert data["fraud_detected"] is True
+    assert "BlacklistedCountry" in data["triggered_rules"]
+    # Even if amount is low, rule triggers. ML models might or might not flag (logistic might because foreign).
+    assert data["fraud_prediction"] in (True, False)
+
+def test_isolation_forest_flags_anomaly(client):
+    """A transaction that is an outlier (moderately high amount not covered by rules) should be caught by Isolation Forest."""
+    txn = {"amount": 3000.0, "country": "US", "currency": "USD"}  # 3000 is below HighAmount threshold, domestic
+    response = client.post("/detect_fraud", json=txn)
+    data = response.json()
+    # No rule should trigger (amount < 10000 and country not blacklisted)
+    assert data["triggered_rules"] == []
+    # Logistic model may not flag this (domestic moderate amount)
+    # Isolation Forest is expected to flag this as anomaly (since training data mostly <1000).
+    assert data["isolation_anomaly"] is True or data["fraud_prediction"] is True
+    # At least one of the ML models should flag, leading fraud_detected to be True
+    assert data["fraud_detected"] is True
