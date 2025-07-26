@@ -27,6 +27,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("fraud_detector")
 
+# ---- API Endpoint Constants ----
+DETECT_FRAUD_ENDPOINT = "/detect_fraud"
+
 # ---- Configurable Rule Definitions ----
 
 # Default rule set (JSON format) embedded in the code.
@@ -277,7 +280,7 @@ class FraudResult(BaseModel):
     fraud_probability: float = Field(..., description="Fraud probability score from the logistic regression model (0.0 to 1.0)")
     fraud_prediction: bool = Field(..., description="Logistic regression model's binary fraud classification (True=fraud)")
 
-@app.post("/detect_fraud", response_model=FraudResult, summary="Score a transaction for fraud risk",
+@app.post(DETECT_FRAUD_ENDPOINT, response_model=FraudResult, summary="Score a transaction for fraud risk",
           description="Analyzes a credit card transaction using rule-based validation and ML models to determine if it's potentially fraudulent.")
 def detect_fraud(transaction: TransactionInput):
     """
@@ -399,7 +402,7 @@ def test_mask_pan():
 def test_no_rules_trigger_no_fraud(client):
     """A legitimate transaction (small amount, domestic country) should not be flagged as fraud."""
     txn = {"amount": 100.0, "country": "US", "currency": "USD"}
-    response = client.post("/detect_fraud", json=txn)
+    response = client.post(DETECT_FRAUD_ENDPOINT, json=txn)
     assert response.status_code == 200
     data = response.json()
     # No rules triggered, models should likely not flag this as fraud.
@@ -412,7 +415,7 @@ def test_no_rules_trigger_no_fraud(client):
 def test_high_amount_triggers_rule(client):
     """A very high amount transaction should trigger the HighAmount rule and be flagged."""
     txn = {"amount": 20000.0, "country": "US", "currency": "USD"}
-    response = client.post("/detect_fraud", json=txn)
+    response = client.post(DETECT_FRAUD_ENDPOINT, json=txn)
     data = response.json()
     assert data["fraud_detected"] is True
     # HighAmount rule should be triggered
@@ -424,7 +427,7 @@ def test_high_amount_triggers_rule(client):
 def test_blacklisted_country_triggers_rule(client):
     """A transaction from a blacklisted country should trigger the BlacklistedCountry rule."""
     txn = {"amount": 50.0, "country": "IR", "currency": "USD"}  # Iran is blacklisted in default rules
-    response = client.post("/detect_fraud", json=txn)
+    response = client.post(DETECT_FRAUD_ENDPOINT, json=txn)
     data = response.json()
     assert data["fraud_detected"] is True
     assert "BlacklistedCountry" in data["triggered_rules"]
@@ -434,7 +437,7 @@ def test_blacklisted_country_triggers_rule(client):
 def test_isolation_forest_flags_anomaly(client):
     """A transaction that is an outlier (moderately high amount not covered by rules) should be caught by Isolation Forest."""
     txn = {"amount": 3000.0, "country": "US", "currency": "USD"}  # 3000 is below HighAmount threshold, domestic
-    response = client.post("/detect_fraud", json=txn)
+    response = client.post(DETECT_FRAUD_ENDPOINT, json=txn)
     data = response.json()
     # No rule should trigger (amount < 10000 and country not blacklisted)
     assert data["triggered_rules"] == []
