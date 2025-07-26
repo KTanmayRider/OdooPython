@@ -13,7 +13,7 @@ pytest unit tests are included for validating functionality.
 import os
 import json
 import logging
-from typing import List, Optional, Any, Dict
+from typing import List, Optional, Any, Dict, Union
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sklearn.ensemble import IsolationForest
@@ -82,58 +82,79 @@ class RuleEngine:
         """
         self.rules = rules
 
+    def _evaluate_numeric_rule(self, actual_value: Any, expected_value: Any, operator: str) -> bool:
+        """Helper method to evaluate numeric comparison rules."""
+        try:
+            actual_float = float(actual_value)
+            expected_float = float(expected_value)
+            if operator == ">":
+                return actual_float > expected_float
+            elif operator == "<":
+                return actual_float < expected_float
+            return False
+        except (ValueError, TypeError):
+            return False
+
+    def _evaluate_equality_rule(self, actual_value: Any, expected_value: Any, operator: str) -> bool:
+        """Helper method to evaluate equality comparison rules."""
+        if operator == "==":
+            return actual_value == expected_value
+        elif operator == "!=":
+            return actual_value != expected_value
+        return False
+
+    def _evaluate_membership_rule(self, actual_value: Any, expected_value: Any, operator: str) -> bool:
+        """Helper method to evaluate membership rules (in/not in)."""
+        if operator == "in":
+            if isinstance(expected_value, (list, tuple)):
+                return actual_value in expected_value
+            else:
+                return actual_value == expected_value
+        elif operator == "not in":
+            if isinstance(expected_value, (list, tuple)):
+                return actual_value not in expected_value
+            else:
+                return actual_value != expected_value
+        return False
+
+    def _evaluate_single_rule(self, rule: Dict[str, Any], transaction: Dict[str, Any]) -> bool:
+        """Helper method to evaluate a single rule against transaction data."""
+        field = rule.get("field")
+        operator = rule.get("operator")
+        expected_value = rule.get("value")
+        
+        if field not in transaction:
+            return False
+            
+        actual_value = transaction[field]
+        
+        try:
+            if operator in [">", "<"]:
+                return self._evaluate_numeric_rule(actual_value, expected_value, operator)
+            elif operator in ["==", "!="]:
+                return self._evaluate_equality_rule(actual_value, expected_value, operator)
+            elif operator in ["in", "not in"]:
+                return self._evaluate_membership_rule(actual_value, expected_value, operator)
+            else:
+                logger.warning("Unsupported operator '%s' in rule '%s'", operator, rule.get("name"))
+                return False
+        except Exception as e:
+            logger.error("Error evaluating rule '%s': %s", rule.get("name"), e)
+            return False
+
     def evaluate(self, transaction: Dict[str, Any]) -> List[str]:
         """
         Evaluate all rules against the given transaction data.
         Returns a list of rule names that were triggered (violated) by the transaction.
         """
         triggered_rules: List[str] = []
+        
         for rule in self.rules:
-            field = rule.get("field")
-            operator = rule.get("operator")
-            expected_value = rule.get("value")
-            # If the field is missing in transaction, skip evaluation.
-            if field not in transaction:
-                continue
-            actual_value = transaction[field]
-            triggered = False
-            try:
-                # Determine rule condition outcome based on operator.
-                if operator == ">":
-                    # Assuming numeric comparison
-                    triggered = float(actual_value) > float(expected_value)
-                elif operator == "<":
-                    triggered = float(actual_value) < float(expected_value)
-                elif operator == "==":
-                    triggered = actual_value == expected_value
-                elif operator == "!=":
-                    triggered = actual_value != expected_value
-                elif operator == "in":
-                    # expected_value should be a list for 'in' operator
-                    if isinstance(expected_value, (list, tuple)):
-                        triggered = actual_value in expected_value
-                    else:
-                        # If value is not list, treat it as single element list
-                        triggered = actual_value == expected_value
-                elif operator == "not in":
-                    if isinstance(expected_value, (list, tuple)):
-                        triggered = actual_value not in expected_value
-                    else:
-                        triggered = actual_value != expected_value
-                else:
-                    # Unsupported operator: skip or log a warning
-                    logger.warning("Unsupported operator '%s' in rule '%s'", operator, rule.get("name"))
-                    continue
-            except Exception as e:
-                # If any error in evaluating rule, log and skip it (robustness)
-                logger.error("Error evaluating rule '%s': %s", rule.get("name"), e)
-                continue
-
-            if triggered:
+            if self._evaluate_single_rule(rule, transaction):
                 rule_name = str(rule.get("name") or "UnnamedRule")
                 triggered_rules.append(rule_name)
-                # Log the rule trigger for audit (without sensitive data if possible)
                 logger.info("Rule triggered: %s -> %s", rule_name, rule.get("message"))
+                
         return triggered_rules
 
 # Instantiate the global RuleEngine with the loaded configuration
@@ -149,6 +170,8 @@ class FraudModelManager:
     """
     def __init__(self):
         # Initialize models; they will be trained on startup.
+        # Create random generator for reproducible results
+        self.rng = np.random.default_rng(42)
         self.isolation_forest = IsolationForest(n_estimators=100, contamination=0.1, random_state=42)
         self.logistic_model = LogisticRegression(solver='liblinear', random_state=0)
 
@@ -162,23 +185,22 @@ class FraudModelManager:
         """
         # Synthetic training data for Isolation Forest (unsupervised):
         # Assume normal transactions have relatively lower amounts (e.g., < $1000 mostly).
-        rng = np.random.RandomState(42)
         # Generate normal transaction feature data for training.
         # Features: [amount, is_foreign]
         num_samples = 1000
-        amounts = rng.normal(loc=500, scale=200, size=num_samples)  # mostly around 500
+        amounts = self.rng.normal(loc=500, scale=200, size=num_samples)  # mostly around 500
         amounts = np.clip(amounts, a_min=0, a_max=1000)  # cap at 1000 to avoid extreme outliers in training
-        countries = rng.choice([0, 1], size=num_samples, p=[0.8, 0.2])  
+        countries = self.rng.choice([0, 1], size=num_samples, p=[0.8, 0.2])  
         # Here 0 = domestic (e.g., "US"), 1 = foreign, simulating 20% foreign transactions
-        X_train_iso = np.column_stack((amounts, countries))
+        x_train_iso = np.column_stack((amounts, countries))
         # Fit Isolation Forest on this "normal" data
-        self.isolation_forest.fit(X_train_iso)
+        self.isolation_forest.fit(x_train_iso)
         logger.info("Isolation Forest model trained on synthetic normal transaction data.")
 
         # Synthetic training data for Logistic Regression (supervised):
         # We'll create a small labeled dataset for demonstration purposes.
         # Feature 1: amount, Feature 2: is_foreign (0 or 1 as above).
-        X_train_log = np.array([
+        x_train_log = np.array([
             [50.0, 0],      # low amount, domestic -> not fraud
             [200.0, 1],     # low amount, foreign -> fraud (perhaps stolen card used abroad for small amount)
             [5000.0, 0],    # high amount, domestic -> not fraud (e.g., a legitimate large purchase in home country)
@@ -186,7 +208,7 @@ class FraudModelManager:
         ])
         y_train_log = np.array([0, 1, 0, 1])  # corresponding labels
         try:
-            self.logistic_model.fit(X_train_log, y_train_log)
+            self.logistic_model.fit(x_train_log, y_train_log)
             logger.info("Logistic Regression model trained on synthetic labeled data.")
         except Exception as e:
             logger.error("Error training Logistic Regression model: %s", e)
@@ -273,10 +295,6 @@ def detect_fraud(transaction: TransactionInput):
     masked_card = None
     if tx.get("card_number"):
         masked_card = mask_pan(tx["card_number"])
-        tx_masked_for_log = tx.copy()
-        tx_masked_for_log["card_number"] = masked_card
-    else:
-        tx_masked_for_log = tx
 
     # Log the incoming request (with masked details to avoid sensitive data leakage).
     logger.info("Processing transaction %s: amount=%.2f, country=%s, card=%s",
@@ -310,19 +328,34 @@ def detect_fraud(transaction: TransactionInput):
     return result
 
 # Utility function for masking a credit card number (PAN) for logs or output
-def mask_pan(pan: str) -> str:
+def mask_pan(pan: Union[str, int, None]) -> Optional[str]:
     """
     Mask a payment card number to show at most first 6 and last 4 digits (PCI DSS compliant).
     If the PAN is shorter, masks all but last 1-2 digits.
+    
+    Args:
+        pan: Payment card number as string, int, or None
+        
+    Returns:
+        Masked PAN string or None if input is None
     """
     if pan is None:
         return None
-    pan_str = str(pan)
+    
+    # Convert to string and handle different input types
+    try:
+        pan_str = str(pan).strip()
+    except (ValueError, AttributeError):
+        return None
+        
+    if not pan_str:
+        return None
+        
     pan_len = len(pan_str)
     if pan_len <= 4:
         # If very short (non-standard PAN), mask everything except last digit
         return "*" * (pan_len - 1) + pan_str[-1:]
-    # PCI DSS allows showing first 6 and last 4 at most:contentReference[oaicite:23]{index=23}, but we'll mask fully except last 4 for privacy.
+    # PCI DSS allows showing first 6 and last 4 at most, but we'll mask fully except last 4 for privacy.
     # Here we choose to mask all but last 4 (common practice for logs).
     masked_section = "*" * max(0, pan_len - 4)
     visible_section = pan_str[-4:]
@@ -360,6 +393,8 @@ def test_mask_pan():
     assert mask_pan("1234") == "1234"  # 4-digit (mask nothing except possibly first 3, but we leave as is for short)
     assert mask_pan("123") == "**3"    # shorter than 4, mask all but last
     assert mask_pan(None) is None
+    assert mask_pan(1234567890123456) == "************3456"  # Test integer input
+    assert mask_pan("") is None  # Test empty string
 
 def test_no_rules_trigger_no_fraud(client):
     """A legitimate transaction (small amount, domestic country) should not be flagged as fraud."""
