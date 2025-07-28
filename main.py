@@ -2,7 +2,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 from fastapi import FastAPI, HTTPException, Depends, status, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -63,7 +63,7 @@ class ActivityTracker:
             hashed_user = hashlib.sha256(user_id.encode()).hexdigest()
             entry = {
                 "hashed_user": hashed_user,
-                "timestamp": datetime.utcnow(),
+                "timestamp": datetime.now(timezone.utc),
                 "action": action,
                 "metadata": self._encrypt_sensitive(metadata) if metadata else None
             }
@@ -103,8 +103,14 @@ class MLModelManager:
         
     def _train_dummy_models(self):
         """Train with initial dummy data"""
-        X = np.random.rand(100, 5)
-        y = np.random.randint(0, 2, 100)
+        # Step 1: Replace legacy numpy random functions with numpy.random.Generator
+        # OLD:
+        # X = np.random.rand(100, 5)
+        # y = np.random.randint(0, 2, 100)
+        rng = np.random.default_rng(42)  # Use Generator for reproducibility
+        X = rng.random((100, 5))
+        y = rng.integers(0, 2, 100)
+        # This ensures modern, reproducible random number generation
         X_scaled = self.scaler.fit_transform(X)
         self.models["iso_forest"].fit(X_scaled)
         self.models["log_reg"].fit(X_scaled, y)
@@ -366,7 +372,7 @@ def client():
 def test_fraud_detection(client):
     test_transaction = {
         "amount": 1200,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(timezone.utc),
         "country": "US",
         "user_id": "user_12345",
         "features": [0.5, 1.2, 0.8, 1.5, 0.2]
