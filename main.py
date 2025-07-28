@@ -360,7 +360,10 @@ async def health_check():
         "status": "operational",
         "components": {
             "database": "connected" if activity_tracker.client.server_info() else "disconnected",
-            "models": {name: "loaded" for name in model_manager.models},
+            # Step 1: Replace dictionary comprehension with dict.fromkeys for constant value
+            # OLD: "models": {name: "loaded" for name in model_manager.models},
+            "models": dict.fromkeys(model_manager.models, "loaded"),
+            # This ensures efficient and clear population of the dictionary with a constant value
             "rules": f"{len(rule_engine.rules)} active"
         }
     }
