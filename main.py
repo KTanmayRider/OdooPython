@@ -111,9 +111,11 @@ class MLModelManager:
         X = rng.random((100, 5))
         y = rng.integers(0, 2, 100)
         # This ensures modern, reproducible random number generation
-        X_scaled = self.scaler.fit_transform(X)
-        self.models["iso_forest"].fit(X_scaled)
-        self.models["log_reg"].fit(X_scaled, y)
+        # Step 1: Rename X_scaled to x_scaled to comply with naming conventions
+        x_scaled = self.scaler.fit_transform(X)
+        self.models["iso_forest"].fit(x_scaled)
+        self.models["log_reg"].fit(x_scaled, y)
+        # This ensures variable naming follows the required convention
         self._save_models()
         
     def _save_models(self):
